@@ -24,6 +24,8 @@ import android.os.Build;
 import android.os.Bundle;
 import android.preference.PreferenceManager;
 import android.support.annotation.IntDef;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 import android.support.v4.app.NotificationCompat;
 import android.support.v4.app.TaskStackBuilder;
 import android.text.format.Time;
@@ -36,12 +38,24 @@ import com.example.android.sunshine.app.R;
 import com.example.android.sunshine.app.Utility;
 import com.example.android.sunshine.app.data.WeatherContract;
 import com.example.android.sunshine.app.muzei.WeatherMuzeiSource;
+import com.google.android.gms.common.ConnectionResult;
+import com.google.android.gms.common.api.GoogleApiClient;
+import com.google.android.gms.common.api.PendingResult;
+import com.google.android.gms.common.api.ResolvingResultCallbacks;
+import com.google.android.gms.common.api.ResultCallback;
+import com.google.android.gms.common.api.Status;
+import com.google.android.gms.wearable.Asset;
+import com.google.android.gms.wearable.DataApi;
+import com.google.android.gms.wearable.PutDataMapRequest;
+import com.google.android.gms.wearable.PutDataRequest;
+import com.google.android.gms.wearable.Wearable;
 
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -52,7 +66,7 @@ import java.net.URL;
 import java.util.Vector;
 import java.util.concurrent.ExecutionException;
 
-public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
+public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter implements GoogleApiClient.OnConnectionFailedListener, GoogleApiClient.ConnectionCallbacks{
     public final String LOG_TAG = SunshineSyncAdapter.class.getSimpleName();
     public static final String ACTION_DATA_UPDATED =
             "com.example.android.sunshine.app.ACTION_DATA_UPDATED";
@@ -62,7 +76,11 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
     public static final int SYNC_FLEXTIME = SYNC_INTERVAL/3;
     private static final long DAY_IN_MILLIS = 1000 * 60 * 60 * 24;
     private static final int WEATHER_NOTIFICATION_ID = 3004;
-
+    GoogleApiClient mGoogleApiClient = new GoogleApiClient.Builder(getContext())
+            .addApi(Wearable.API)
+            .addConnectionCallbacks(this)
+            .addOnConnectionFailedListener(this)
+            .build();
 
     private static final String[] NOTIFY_WEATHER_PROJECTION = new String[] {
             WeatherContract.WeatherEntry.COLUMN_WEATHER_ID,
@@ -76,6 +94,21 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
     private static final int INDEX_MAX_TEMP = 1;
     private static final int INDEX_MIN_TEMP = 2;
     private static final int INDEX_SHORT_DESC = 3;
+
+    @Override
+    public void onConnectionFailed(@NonNull ConnectionResult connectionResult) {
+
+    }
+
+    @Override
+    public void onConnected(@Nullable Bundle bundle) {
+
+    }
+
+    @Override
+    public void onConnectionSuspended(int i) {
+
+    }
 
     @Retention(RetentionPolicy.SOURCE)
     @IntDef({LOCATION_STATUS_OK, LOCATION_STATUS_SERVER_DOWN, LOCATION_STATUS_SERVER_INVALID,  LOCATION_STATUS_UNKNOWN, LOCATION_STATUS_INVALID})
@@ -345,8 +378,10 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
                         new String[] {Long.toString(dayTime.setJulianDay(julianStartDay-1))});
 
                 updateWidgets();
+                sendDataToWearApp(cVVector.get(0));
                 updateMuzei();
                 notifyWeather();
+
             }
             Log.d(LOG_TAG, "Sync Complete. " + cVVector.size() + " Inserted");
             setLocationStatus(getContext(), LOCATION_STATUS_OK);
@@ -358,6 +393,44 @@ public class SunshineSyncAdapter extends AbstractThreadedSyncAdapter {
         }
     }
 
+    private static Asset createAssetFromBitmap(Bitmap bitmap) {
+        final ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, byteStream);
+        return Asset.createFromBytes(byteStream.toByteArray());
+    }
+
+    private void sendDataToWearApp(ContentValues values){
+        //we don't need all the values in wear app
+        if(!mGoogleApiClient.isConnected())
+        {
+            mGoogleApiClient.connect();
+        }
+        Log.v(LOG_TAG, "decode resource start");
+        Bitmap b = BitmapFactory.decodeResource(getContext().getResources(), Utility.getArtResourceForWeatherCondition(values.getAsInteger(WeatherContract.WeatherEntry.COLUMN_WEATHER_ID)));
+        Bitmap bitmap = Bitmap.createScaledBitmap(b, 60, 60, false);
+        Log.v(LOG_TAG, "decode resource end");
+        Asset asset = createAssetFromBitmap(bitmap);
+
+        PutDataMapRequest putDataMapReq = PutDataMapRequest.create("/weather");
+        putDataMapReq.getDataMap().putAsset("weatherImage", asset);
+        putDataMapReq.getDataMap().putString("maxTemp", Utility.formatTemperature(getContext(), values.getAsDouble(WeatherContract.WeatherEntry.COLUMN_MAX_TEMP)));
+        putDataMapReq.getDataMap().putString("minTemp", Utility.formatTemperature(getContext(), values.getAsDouble(WeatherContract.WeatherEntry.COLUMN_MIN_TEMP)));
+        putDataMapReq.getDataMap().putString("desc", values.getAsString(WeatherContract.WeatherEntry.COLUMN_SHORT_DESC));
+        putDataMapReq.getDataMap().putInt(WeatherContract.WeatherEntry.COLUMN_WEATHER_ID, values.getAsInteger(WeatherContract.WeatherEntry.COLUMN_WEATHER_ID));
+        PutDataRequest putDataReq = putDataMapReq.asPutDataRequest();
+        putDataReq.setUrgent();
+        Wearable.DataApi.putDataItem(mGoogleApiClient, putDataReq).setResultCallback(new ResultCallback<DataApi.DataItemResult>() {
+            @Override
+            public void onResult(@NonNull DataApi.DataItemResult dataItemResult) {
+                if(!dataItemResult.getStatus().isSuccess()){
+                    Log.e(LOG_TAG, "sendDataToWearApp. Failed to send weater data");
+                } else {
+                    Log.v(LOG_TAG, "sendDataToWearApp. Successfully sent weather data");
+                }
+
+            }
+        });
+    }
     private void updateWidgets() {
         Context context = getContext();
         // Setting the package ensures that only components in our app will receive the broadcast
